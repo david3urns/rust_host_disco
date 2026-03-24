@@ -1,0 +1,8 @@
+[package]
+name = "net_scanner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+threadpool = "1.8" # a tiny thread‑pool implementation
+num_cpus = "1.16"  # utility to query the number of logical CPUs

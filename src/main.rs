@@ -10,172 +10,252 @@ Add threading
 
 #![allow(unused_comparisons)]
 
-use std::process::{Command, Stdio};
-use std::str;
-use std::io::{self, Write};
-use std::net::{Ipv4Addr};
 
-//function for validating the IP and CIDR provided by the user
-fn validate_ip_cidr(input: &str) -> Result<(String, u8), String> {
+use std::io::{self, Write};
+use std::net::Ipv4Addr;
+use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::Duration;
+
+use threadpool::ThreadPool;
+use num_cpus;
+
+/// ---------------------------------------------------------------------------
+/// Helper: print a nice boxed banner
+/// ---------------------------------------------------------------------------
+fn banner(title: &str) {
+    let h = "═";
+    let v = "║";
+    let tl = "╔";
+    let tr = "╗";
+    let bl = "╚";
+    let br = "╝";
+
+    let w = title.len();
+    let top = format!("{}{}{}{}{}", tl, h, h.repeat(w), h, tr);
+    let bottom = format!("{}{}{}{}{}", bl, h, h.repeat(w), h, br);
+    println!("{}", top);
+    println!("{} {} {}", v, title, v);
+    println!("{}", bottom);
+}
+
+/// ---------------------------------------------------------------------------
+/// Helper: clear the terminal
+/// ---------------------------------------------------------------------------
+fn clear_screen() {
+    print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+    io::stdout().flush().unwrap();
+}
+
+/// ---------------------------------------------------------------------------
+/// Validate `IP/CIDR`
+/// ---------------------------------------------------------------------------
+fn validate_ip_cidr(input: &str) -> Result<(Ipv4Addr, u8), String> {
     let parts: Vec<&str> = input.split('/').collect();
     if parts.len() != 2 {
-        return Err("Invalid format, expected IP with CIDR prefix.".to_string());
+        return Err("expected <IP>/<CIDR>".into());
     }
 
-    //trim the IP from the ip/cidr combo
-    let ip_address = parts[0].trim();
-    if !validate_ip_address(ip_address) {
-        return Err("Invalid IP address.".to_string());
+    let ip: Ipv4Addr = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| "invalid IPv4 address".to_string())?;
+
+    let cidr: u8 = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| "CIDR must be a number".to_string())?;
+    if cidr > 32 {
+        return Err("CIDR must be in the range 0‑32".into());
     }
 
-    //trim the cidr from the ip/cidr combo
-    let cidr_prefix: u8 = match parts[1].trim().parse() {
-        Ok(prefix) => prefix,
-        Err(_) => return Err("Invalid CIDR prefix.".to_string()),
-    };
-
-    //checks the CIDR notation to make sure it is within range
-    if cidr_prefix > 32 {
-        return Err("CIDR prefix must be a number between 0 - 32.".to_string());
-    }
-
-    Ok((ip_address.to_string(), cidr_prefix))
+    Ok((ip, cidr))
 }
 
-//function to validate the IP address length and octet values,
-fn validate_ip_address(ip_address: &str) -> bool {
-    let octets: Vec<&str> = ip_address.split('.').collect();
-    if octets.len() != 4 {
-        return false;
-    }
-
-    for octet in octets {
-        if let Ok(value) = octet.parse::<u8>() {
-            if value > 255 {
-                return false;
-            }
-        }
-        else {
-            return false;
-        }
-    }
-
-    true
+/// ---------------------------------------------------------------------------
+/// Loop‑back detection (only a warning)
+/// ---------------------------------------------------------------------------
+fn is_loopback_network(ip: Ipv4Addr, cidr: u8) -> bool {
+    ip.octets()[0] == 127 && cidr >= 8
 }
 
+/// ---------------------------------------------------------------------------
+/// Platform‑specific flag for “one ping packet”
+/// ---------------------------------------------------------------------------
+#[cfg(unix)]
+fn ping_one_flag() -> &'static str {
+    "-c"
+}
+#[cfg(windows)]
+fn ping_one_flag() -> &'static str {
+    "-n"
+}
 
+/// ---------------------------------------------------------------------------
+/// Perform a single ping, returning true if the output looks successful
+/// ---------------------------------------------------------------------------
+fn ping_is_up(addr: Ipv4Addr) -> bool {
+    let out = Command::new("ping")
+        .arg(addr.to_string())
+        .arg(ping_one_flag())
+        .arg("1")
+        .stdout(Stdio::piped())
+        .output()
+        .expect("failed to spawn ping");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout.contains("1 received")
+        || stdout.contains("1 packets received")
+        || stdout.contains("Received = 1")
+}
+
+/// ---------------------------------------------------------------------------
+/// Main – multithreaded, ordered, with a live progress indicator
+/// ---------------------------------------------------------------------------
 fn main() {
     clear_screen();
-    //get user input:
     banner("Network Host Discovery");
-    println!("");
-    let mut ip_cidr = String::new();
-    
+    println!();
+
+    // --------------------------------------------------------------
+    // Prompt for CIDR input
+    // --------------------------------------------------------------
     print!("Please enter an IP address with CIDR notation (e.g. 192.168.1.0/24): ");
     io::stdout().flush().unwrap();
-    io::stdin().read_line(&mut ip_cidr).unwrap();
-    let ip_cidr = ip_cidr.trim();
-  
-    //Validate IP with CIDR prefix
-    let (_ip_address, _cidr_prefix) = match validate_ip_cidr(ip_cidr) {
-        Ok((ip, cidr)) => (ip, cidr),
-        Err(error) => {
-            eprintln!("Input validation failed, {}.", error);
+
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).unwrap();
+    let line = line.trim();
+
+    // --------------------------------------------------------------
+    // Validate
+    // --------------------------------------------------------------
+    let (base_ip, cidr) = match validate_ip_cidr(line) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Input validation failed: {e}");
             return;
         }
     };
-    
-    //split the ip_cidr variable into two variables, one for IP, one for CIDR
-    let mut parts = ip_cidr.split("/");
-    let ip_address = parts.next().unwrap();
-    let cidr_not = parts.next().unwrap();
-    
-    //parse and convert the ip address from a string into an ipv4addr that can be used
-    let ip_addr_parse = ip_address.parse::<Ipv4Addr>().unwrap();
-    let cidr_not_parse = cidr_not.parse().unwrap();
-    let subnet_mask = !0u32.checked_shr(cidr_not_parse).unwrap_or(0);
 
-    //convert the ip address and subnet mask to a u32
-    let ip_address_u32 = u32::from(ip_addr_parse);
-    let subnet_mask_u32 = u32::from(subnet_mask);
-
-    //create a vec to store all up ip addresses:
-    let mut up_ips = Vec::new();
-
-    //create variables for tracking total versus up ip scans:
-    let mut total_count = 0;
-    let mut up_count = 0;
-    
-    //iterate through all the possible IP addresses given the provided IP/CIDR, sending
-    //each possible address to the ping function above
-
-    println!("");
-    for i in 0..(1 << (32 - cidr_not_parse)) {
-        let address_u32 = ip_address_u32 & subnet_mask_u32 | i;
-        let address = Ipv4Addr::from(address_u32);
-        let address: &str = &address.to_string();
-
-    //start the process of pinging all the addresses
-    let ping_out = Command::new("ping")     //runs the ping command
-    .arg(address)                                  //provides the argument from the function as an argument to the ping command
-    .arg("-c 1")                                   //adds the -c 1 argument, telling the command to only run once (ping will run until interrupted by default)
-    .stdout(Stdio::piped())                   //captures the output of the ping command
-    .output()
-    .unwrap();
-
-    let ping_stdout = String::from_utf8(ping_out.stdout).unwrap();
-  
-    total_count += 1;
-
-    if ping_stdout.contains("1 received") {
-        up_count += 1;
-        println!("Ping successful, {} is \x1b[0;32mup\x1b[0m.", address);
-        up_ips.push(address.to_string());
+    if is_loopback_network(base_ip, cidr) {
+        eprintln!("NOTE: The supplied network is inside the 127.0.0.0/8 loop‑back range.");
+        eprintln!("All hosts in this range will appear \"up\" because they resolve locally.\n");
     }
 
-    else {
-        println!("Ping unsuccessful, {} is \x1b[31mdown\x1b[0m.", address);
+    // --------------------------------------------------------------
+    // Compute the address range (skip .0 and .255)
+    // --------------------------------------------------------------
+    let host_bits = 32 - cidr;
+    let total_hosts: u32 = 1u32 << host_bits;          // includes .0 and .255
+    let netmask: u32 = (!0u32) << host_bits;
+    let network: u32 = u32::from(base_ip) & netmask;
+    let host_count = (total_hosts - 2) as usize; // .0 and .255 are omitted
+
+    // --------------------------------------------------------------
+    // Shared data structures
+    // --------------------------------------------------------------
+    // 1️⃣ Ordered result vector (None = not finished yet)
+    let results: Arc<Mutex<Vec<Option<bool>>>> = Arc::new(Mutex::new(vec![None; host_count]));
+
+    // 2️⃣ Atomic counters for the progress thread
+    let scanned = Arc::new(AtomicUsize::new(0));
+    let up_cnt = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+
+    // --------------------------------------------------------------
+    // Thread‑pool (size = number of logical CPUs)
+    // --------------------------------------------------------------
+    let pool = ThreadPool::new(num_cpus::get());
+
+    // --------------------------------------------------------------
+    // Progress‑display thread
+    // --------------------------------------------------------------
+    let prog_scanned = Arc::clone(&scanned);
+    let prog_total = host_count;
+    let prog_finished = Arc::clone(&finished);
+
+    let progress_handle = thread::spawn(move || {
+        while !prog_finished.load(Ordering::Relaxed) {
+            let done = prog_scanned.load(Ordering::Relaxed);
+            let percent = (done as f64 / prog_total as f64) * 100.0;
+            // carriage‑return keeps us on a single line
+            print!("\rScanned {}/{} ({:.1}%)", done, prog_total, percent);
+            io::stdout().flush().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        }
+        // make sure the line ends before the summary is printed
+        println!();
+    });
+
+    // --------------------------------------------------------------
+    // Submit a job for every host (the pool limits concurrency)
+    // --------------------------------------------------------------
+    for host_offset in 1..(total_hosts - 1) {
+        let idx = (host_offset - 1) as usize;
+        let addr = Ipv4Addr::from(network | host_offset);
+
+        // cloned handles for the closure
+        let results_clone = Arc::clone(&results);
+        let scanned_clone = Arc::clone(&scanned);
+        let up_clone = Arc::clone(&up_cnt);
+
+        pool.execute(move || {
+            let up = ping_is_up(addr);
+
+            // store result in the correct slot
+            {
+                let mut guard = results_clone.lock().unwrap();
+                guard[idx] = Some(up);
+            }
+
+            // update progress counters
+            scanned_clone.fetch_add(1, Ordering::Relaxed);
+            if up {
+                up_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
     }
-    io::stdout().flush().unwrap();
-}
 
-println!("");
-banner("Results");
-println!("");
-//print summary of all up ip addresses:
-println!("The following IP addresses were up:");
-for ip in up_ips{
-    println!("\x1b[0;32m{}\x1b[0m", ip);
-}
+    // --------------------------------------------------------------
+    // Wait for the pool to finish all work
+    // --------------------------------------------------------------
+    pool.join(); // blocks until the work queue is empty
 
-//print summary of up vs total ports:
-println!("");
-println!("Scanned a total of {} IP addresses, of which {} were up.", total_count, up_count);
+    // Signal the progress thread to stop and wait for it
+    finished.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
 
-//function to create a banner for each menu
-fn banner(ban_title: &str) {
-    let h_border = "═";
-    let v_border = "║";
-    let tl_corner = "╔";   
-    let tr_corner = "╗";
-    let bl_corner = "╚";
-    let br_corner = "╝";
+    // --------------------------------------------------------------
+    // Ordered final output (hosts that are up appear in green)
+    // --------------------------------------------------------------
+    println!();
+    banner("Results");
+    println!("\nThe following IP addresses responded to ping:");
 
-    //determine the length of the title string
-    let title_length = ban_title.len();
+    let guard = results.lock().unwrap();
+    let mut up_total = 0usize;
+    for (i, entry) in guard.iter().enumerate() {
+        let host_offset = (i as u32) + 1;
+        let addr = Ipv4Addr::from(network | host_offset);
 
-    //print the actual box:
-    println!("{}{}{}{}{}", tl_corner, h_border, h_border.repeat(title_length), h_border, tr_corner);
-    println!("{}{}{}{}{}", v_border, " ", ban_title, " ", v_border);
-    println!("{}{}{}{}{}", bl_corner, h_border, h_border.repeat(title_length), h_border, br_corner);
-
-    //future feature to justify and add color to the banner and text
-}
-
-fn clear_screen(){
-    print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+        if let Some(true) = entry {
+            up_total += 1;
+            // green text
+            println!("\x1b[0;32m{} is up\x1b[0m", addr);
+        } else {
+            // red text for down hosts (optional)
+            println!("\x1b[31m{} is down\x1b[0m", addr);
+        }
     }
 
+    println!(
+        "\nScanned a total of {} IP addresses, of which {} were up.",
+        host_count, up_total
+    );
 }
-
 
