@@ -1,3 +1,0 @@
-error: 'cargo-clippy' is not installed for the custom toolchain '/home/davidb/.rustup/toolchains/stable-x86_64-unknown-linux-gnu'.
-note: this is a custom toolchain, which cannot use `rustup component add`
-help: if you built this toolchain from source, and used `rustup toolchain link`, then you may be able to build the component with `x.py`
